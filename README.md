@@ -28,7 +28,17 @@ Aage aane wala (phase 2): split-screen layouts, process steps aur stat graphics 
 
 ## Setup
 
-FFmpeg aur Python 3.10+ chahiye.
+FFmpeg aur **Python 3.10–3.12** chahiye. Sabse naye Python par Whisper ka `onnxruntime` package abhi install nahi hota.
+
+Mac:
+
+```bash
+xcode-select --install
+brew install python@3.12 ffmpeg
+python3.12 -m venv .venv
+```
+
+Doosre system:
 
 ```bash
 python -m venv .venv
