@@ -23,7 +23,7 @@ class VideoInfo:
 
 def probe(path: Path) -> VideoInfo:
     out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)],
+        ["ffprobe", "-v", "error", "-show_streams", "-show_format", "-of", "json", str(Path(path).resolve())],
         check=True, capture_output=True, text=True,
     ).stdout
     data = json.loads(out)
@@ -95,7 +95,7 @@ def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
     args: list[str] = []
     parts: list[str] = []
     for i, (p, info) in enumerate(zip(paths, infos)):
-        args += ["-i", str(p)]
+        args += ["-i", str(Path(p).resolve())]
         parts.append(
             f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}]"
@@ -109,7 +109,7 @@ def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
     subprocess.run(
         ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", *args, "-filter_complex", ";".join(parts),
          "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast",
-         "-c:a", "pcm_s16le", str(out)],
+         "-c:a", "pcm_s16le", str(Path(out).resolve())],
         check=True,
     )
     starts, acc = [], 0.0

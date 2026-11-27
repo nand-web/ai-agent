@@ -1,6 +1,7 @@
 """Build and run the FFmpeg command that produces one finished video."""
 from __future__ import annotations
 
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,9 +49,25 @@ def _even(x: float) -> int:
     return max(2, int(round(x / 2)) * 2)
 
 
-def _filter_path(p: Path) -> str:
-    s = str(p.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-    return f"'{s}'"
+SUBS_NAME = "overlay.ass"
+FONTS_DIR = "fonts"
+
+
+def _prepare_workdir(job: "RenderJob") -> Path:
+    """Put the subtitle file and fonts next to each other under plain names.
+
+    FFmpeg then reads them by bare relative name, which avoids path quoting rules that
+    differ between FFmpeg versions (spaces, colons, long temp paths on macOS).
+    """
+    work = Path(job.out).resolve().parent / f".render_{Path(job.out).stem}"
+    (work / FONTS_DIR).mkdir(parents=True, exist_ok=True)
+    for f in FONTS.glob("*.ttf"):
+        dest = work / FONTS_DIR / f.name
+        if not dest.exists():
+            shutil.copyfile(f, dest)
+    if job.ass:
+        shutil.copyfile(job.ass, work / SUBS_NAME)
+    return work
 
 
 def snap(segs: list[Segment], fps: float, duration: float) -> list[Segment]:
@@ -86,7 +103,7 @@ def build_command(job: RenderJob) -> list[str]:
     total = sum(s.dur for s in segs)
     eps = 0.5 / fps
 
-    inputs: list[str] = ["-i", str(job.src)]
+    inputs: list[str] = ["-i", str(Path(job.src).resolve())]
     n_in = 1
 
     def add_input(*args: str) -> int:
@@ -132,7 +149,7 @@ def build_command(job: RenderJob) -> list[str]:
     # ---- B-roll clips
     for k, b in enumerate(job.broll):
         dur = b.end - b.start
-        idx = add_input("-stream_loop", "-1", "-t", f"{dur + 0.5:.2f}", "-i", str(b.path))
+        idx = add_input("-stream_loop", "-1", "-t", f"{dur + 0.5:.2f}", "-i", str(Path(b.path).resolve()))
         g.append(
             f"[{idx}:v]fps={fps},scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,"
             f"format=yuva420p,fade=in:st=0:d=0.2:alpha=1,fade=out:st={max(0.0, dur - 0.2):.2f}:d=0.2:alpha=1,"
@@ -149,7 +166,7 @@ def build_command(job: RenderJob) -> list[str]:
     ey = "H*0.15" if tall else "H*0.16"
     for k, e in enumerate(job.emoji):
         dur = e.end - e.start
-        idx = add_input("-loop", "1", "-framerate", str(fps), "-t", f"{e.end + 0.1:.2f}", "-i", str(e.path))
+        idx = add_input("-loop", "1", "-framerate", str(fps), "-t", f"{e.end + 0.1:.2f}", "-i", str(Path(e.path).resolve()))
         g.append(
             f"[{idx}:v]scale={ew}:-2,format=rgba,"
             f"fade=in:st={e.start:.3f}:d=0.12:alpha=1,fade=out:st={max(e.start, e.end - 0.25):.3f}:d=0.25:alpha=1[em{k}];"
@@ -159,7 +176,7 @@ def build_command(job: RenderJob) -> list[str]:
 
     # ---- logo watermark
     if job.logo:
-        idx = add_input("-i", str(job.logo))
+        idx = add_input("-i", str(Path(job.logo).resolve()))
         lw = _even(W * (0.16 if tall else 0.10))
         m = _even(W * 0.03)
         g.append(
@@ -170,7 +187,7 @@ def build_command(job: RenderJob) -> list[str]:
 
     # ---- text: captions, hook, name, CTA
     if job.ass:
-        g.append(f"[{cur}]ass={_filter_path(job.ass)}:fontsdir={_filter_path(FONTS)}[vt]")
+        g.append(f"[{cur}]ass=filename={SUBS_NAME}:fontsdir={FONTS_DIR}[vt]")
         cur = "vt"
     g.append(f"[{cur}]format=yuv420p[vout]")
 
@@ -186,7 +203,7 @@ def build_command(job: RenderJob) -> list[str]:
     mix = ["voice"]
 
     if job.music:
-        idx = add_input("-stream_loop", "-1", "-i", str(job.music))
+        idx = add_input("-stream_loop", "-1", "-i", str(Path(job.music).resolve()))
         fade_out = max(0.0, total - 2.0)
         g.append(
             f"[{idx}:a]atrim=0:{total:.3f},asetpts=N/SR/TB,aresample=48000,aformat=channel_layouts=stereo,"
@@ -204,7 +221,7 @@ def build_command(job: RenderJob) -> list[str]:
         if t >= total:
             continue
         if path not in sfx_inputs:
-            sfx_inputs[path] = add_input("-i", str(path))
+            sfx_inputs[path] = add_input("-i", str(Path(path).resolve()))
         ms = int(t * 1000)
         g.append(f"[{sfx_inputs[path]}:a]aresample=48000,aformat=channel_layouts=stereo,volume=0.35,adelay={ms}|{ms}[sfx{k}]")
         mix.append(f"sfx{k}")
@@ -227,7 +244,7 @@ def build_command(job: RenderJob) -> list[str]:
         "-pix_fmt", "yuv420p", "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart", "-t", f"{total:.3f}",
-        str(job.out),
+        str(Path(job.out).resolve()),
     ]
 
 
@@ -251,7 +268,11 @@ def run(job: RenderJob, log=print) -> Path:
     cmd = build_command(job)
     job.out.parent.mkdir(parents=True, exist_ok=True)
     log(f"Rendering {job.out.name} ({job.width}x{job.height})")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    work = _prepare_workdir(job)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=work)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-15:])
         raise RuntimeError(f"FFmpeg failed for {job.out.name}:\n{tail}")

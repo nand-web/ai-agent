@@ -30,7 +30,7 @@ def load_audio(path: Path, sr: int = 16000) -> np.ndarray:
     Done here instead of inside faster-whisper so we do not depend on a PyAV version.
     """
     raw = subprocess.run(
-        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(Path(path).resolve()), "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
         check=True, capture_output=True,
     ).stdout
     return np.frombuffer(raw, dtype=np.float32).copy()
