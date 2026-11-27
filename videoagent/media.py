@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
+from .ffmpeg_tools import sdr_filter, video_args
+
 
 @dataclass
 class VideoInfo:
@@ -15,6 +17,7 @@ class VideoInfo:
     fps: float
     duration: float
     has_audio: bool
+    hdr: bool = False       # iPhone HLG / HDR10: needs tone-mapping to look right in SDR
 
     @property
     def aspect(self) -> float:
@@ -46,7 +49,8 @@ def probe(path: Path) -> VideoInfo:
         fps = 30.0
     fps = min(max(round(fps, 3), 15.0), 60.0)
     duration = float(data["format"].get("duration") or v.get("duration") or 0)
-    return VideoInfo(w, h, fps, duration, has_audio)
+    hdr = v.get("color_transfer") in ("arib-std-b67", "smpte2084") or v.get("color_primaries") == "bt2020"
+    return VideoInfo(w, h, fps, duration, has_audio, hdr)
 
 
 def face_center(path: Path, samples: int = 24) -> tuple[float, float]:
@@ -97,7 +101,7 @@ def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
     for i, (p, info) in enumerate(zip(paths, infos)):
         args += ["-i", str(Path(p).resolve())]
         parts.append(
-            f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"[{i}:v]{sdr_filter(info.hdr)}scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
             f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}]"
         )
         if info.has_audio:
@@ -108,7 +112,7 @@ def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
     log(f"Joining {len(paths)} takes...")
     subprocess.run(
         ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", *args, "-filter_complex", ";".join(parts),
-         "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast",
+         "-map", "[v]", "-map", "[a]", *video_args(W, H, intermediate=True),
          "-c:a", "pcm_s16le", str(Path(out).resolve())],
         check=True,
     )

@@ -1,16 +1,13 @@
 """Build and run the FFmpeg command that produces one finished video."""
 from __future__ import annotations
 
-import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import ASSETS
 from .cuts import Segment
+from .ffmpeg_tools import sdr_filter, video_args
 from .media import VideoInfo
-
-FONTS = ASSETS / "fonts"
 
 
 @dataclass
@@ -29,7 +26,7 @@ class RenderJob:
     width: int
     height: int
     face: tuple[float, float] = (0.5, 0.42)
-    ass: Path | None = None
+    text_track: Path | None = None   # concat list of transparent PNG frames (captions, hook, ...)
     zoom_segments: list[int] = field(default_factory=list)  # indices into segs that get a punch-in
     zoom: float = 1.08
     broll: list[Overlay] = field(default_factory=list)
@@ -47,27 +44,6 @@ class RenderJob:
 
 def _even(x: float) -> int:
     return max(2, int(round(x / 2)) * 2)
-
-
-SUBS_NAME = "overlay.ass"
-FONTS_DIR = "fonts"
-
-
-def _prepare_workdir(job: "RenderJob") -> Path:
-    """Put the subtitle file and fonts next to each other under plain names.
-
-    FFmpeg then reads them by bare relative name, which avoids path quoting rules that
-    differ between FFmpeg versions (spaces, colons, long temp paths on macOS).
-    """
-    work = Path(job.out).resolve().parent / f".render_{Path(job.out).stem}"
-    (work / FONTS_DIR).mkdir(parents=True, exist_ok=True)
-    for f in FONTS.glob("*.ttf"):
-        dest = work / FONTS_DIR / f.name
-        if not dest.exists():
-            shutil.copyfile(f, dest)
-    if job.ass:
-        shutil.copyfile(job.ass, work / SUBS_NAME)
-    return work
 
 
 def snap(segs: list[Segment], fps: float, duration: float) -> list[Segment]:
@@ -117,13 +93,13 @@ def build_command(job: RenderJob) -> list[str]:
     keep_a = "+".join(f"gte(t,{s.start:.4f})*lt(t,{s.end:.4f})" for s in segs)
 
     # ---- video: CFR, cut, frame for the target shape
-    g.append(f"[0:v]fps={fps},select='{keep_v}',setpts=N/({fps})/TB[cut]")
+    g.append(f"[0:v]fps={fps},select='{keep_v}',setpts=N/({fps})/TB,{sdr_filter(info.hdr)}setsar=1[cut]")
     tall_src_to_wide = info.aspect < (W / H) * 0.8
     if tall_src_to_wide:
         # vertical source into 16:9: blurred fill behind the sharp video
         g.append(
             f"[cut]split[bgi][fgi];"
-            f"[bgi]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},boxblur=30:2,eq=brightness=-0.08[bg];"
+            f"[bgi]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=40,colorchannelmixer=rr=0.85:gg=0.85:bb=0.85[bg];"
             f"[fgi]scale=-2:{H}:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:0,setsar=1[framed]"
         )
     else:
@@ -186,8 +162,9 @@ def build_command(job: RenderJob) -> list[str]:
         cur = "vl"
 
     # ---- text: captions, hook, name, CTA
-    if job.ass:
-        g.append(f"[{cur}]ass=filename={SUBS_NAME}:fontsdir={FONTS_DIR}[vt]")
+    if job.text_track:
+        idx = add_input("-f", "concat", "-safe", "0", "-i", str(Path(job.text_track).resolve()))
+        g.append(f"[{idx}:v]fps={fps},format=rgba[txt];[{cur}][txt]overlay=0:0:format=auto:eof_action=pass[vt]")
         cur = "vt"
     g.append(f"[{cur}]format=yuv420p[vout]")
 
@@ -240,8 +217,7 @@ def build_command(job: RenderJob) -> list[str]:
         *inputs,
         "-filter_complex", graph,
         "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-crf", str(job.crf), "-preset", job.preset, "-profile:v", "high",
-        "-pix_fmt", "yuv420p", "-r", str(fps),
+        *video_args(W, H, job.crf, job.preset), "-r", str(fps),
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart", "-t", f"{total:.3f}",
         str(Path(job.out).resolve()),
@@ -268,11 +244,7 @@ def run(job: RenderJob, log=print) -> Path:
     cmd = build_command(job)
     job.out.parent.mkdir(parents=True, exist_ok=True)
     log(f"Rendering {job.out.name} ({job.width}x{job.height})")
-    work = _prepare_workdir(job)
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=work)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-15:])
         raise RuntimeError(f"FFmpeg failed for {job.out.name}:\n{tail}")

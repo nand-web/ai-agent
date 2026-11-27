@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from . import assets
 from .config import EditOptions
 from .cuts import Segment, Timeline, filler_indices, keep_segments, restrict
 from .media import face_center, join_takes, probe
-from .overlays import Overlay as AssSize, build_ass
+from .ffmpeg_tools import preflight
+from .overlays import build_events, render_text_track
 from .planner import EditPlan, make_plan
 from .render import Overlay, RenderJob, run, snap
 from .transcript import Word, load_words, save_words, transcribe
@@ -40,7 +42,8 @@ def edit(
     log=print,
 ) -> dict:
     """Edit one video, or several takes of the same recording (joined in the given order)."""
-    out_dir = Path(out_dir)
+    preflight()
+    out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     takes = [Path(v) for v in video] if isinstance(video, (list, tuple)) else [Path(video)]
     take_starts: list[float] | None = None
@@ -127,15 +130,14 @@ def _render_format(fmt, video, info, words: list[Word], removed, base, plan: Edi
     name = opts.person_name if opts.lower_third else ""
     title = opts.person_title if opts.lower_third else ""
 
-    ass_path = out_dir / f"{video.stem}_{fmt}.ass"
-    ass_path.write_text(
-        build_ass(
-            AssSize(W, H, tall), total,
-            words=edited_words if opts.captions else None,
-            caption_style=opts.caption_style, hook=hook, name=name, title=title, cta=cta,
-        ),
-        encoding="utf-8",
+    events = build_events(
+        total,
+        words=edited_words if opts.captions else None,
+        caption_style=opts.caption_style, hook=hook, name=name, title=title, cta=cta,
     )
+    text_dir = out_dir / f".text_{fmt}"
+    shutil.rmtree(text_dir, ignore_errors=True)
+    text_track = render_text_track(events, W, H, total, info.fps, text_dir)
 
     busy_start = HOOK_END if hook else 0.3
     busy_end = total - (4.0 if cta else 0.5)
@@ -184,11 +186,14 @@ def _render_format(fmt, video, info, words: list[Word], removed, base, plan: Edi
     logo = Path(opts.logo_path) if opts.logo_path and Path(opts.logo_path).exists() else None
     job = RenderJob(
         src=video, info=info, segs=segs, out=out_dir / f"{video.stem}_{fmt}.mp4",
-        width=W, height=H, face=face, ass=ass_path,
+        width=W, height=H, face=face, text_track=text_track,
         zoom_segments=list(range(1, len(segs), 2)) if opts.jump_zoom else [],
         broll=broll, emoji=emoji, logo=logo, logo_opacity=opts.logo_opacity,
         music=music, music_volume=opts.music_volume, ducking=opts.ducking,
         sfx=sfx, clean_audio=opts.clean_audio, crf=opts.crf, preset=opts.preset,
     )
     log(f"[{fmt}] {total:.1f}s, {len(segs)} cuts, {len(broll)} B-roll, {len(emoji)} emoji, music: {music.name if music else 'off'}")
-    return run(job, log=log)
+    try:
+        return run(job, log=log)
+    finally:
+        shutil.rmtree(text_dir, ignore_errors=True)

@@ -89,7 +89,8 @@ if videos and len(videos) > 1:
 elif videos:
     order = list(videos)
 if not have_api_key():
-    st.info("ANTHROPIC_API_KEY set nahi hai: AI plan ki jagah simple rules use honge (retakes nahi hatenge, B-roll nahi chunega).")
+    st.info("ANTHROPIC_API_KEY set nahi hai: AI ki jagah simple rules chalenge. Umm, pause aur repeat lines phir bhi hatengi, "
+            "lekin B-roll khud nahi chunega aur hook transcript se banega.")
 
 if order and st.button("Edit video", type="primary", disabled=not formats):
     srcs = [Path(save_upload(v, "in")) for v in order]

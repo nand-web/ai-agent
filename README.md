@@ -81,8 +81,11 @@ Saare options: `python -m videoagent --help`.
 
 ```
 raw video → Whisper (word timing) → Claude edit plan → cuts
-          → FFmpeg: framing + zoom + B-roll + emoji + logo + captions (ASS)
-          → audio: denoise + loudnorm + music ducking + sfx → MP4 (H.264, CRF 18)
+          → text overlays (Pillow PNG) → FFmpeg: framing + zoom + B-roll + emoji + logo + text
+          → audio: denoise + loudnorm + music ducking + sfx → MP4 (H.264)
 ```
+
+Kisi bhi normal FFmpeg build par chalta hai (libass ya libx264 zaroori nahi). iPhone HDR video
+automatically normal rangon mein convert hoti hai. Kai takes ek saath upload kar sakte ho.
 
 Code: `videoagent/` (`pipeline.py` se shuru karo). Tests: `pytest`.

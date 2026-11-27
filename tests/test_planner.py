@@ -77,3 +77,27 @@ def test_partial_repeat_later_is_removed():
     from videoagent.planner import retake_indices
     words = _words("main Rahul FitBox Gym ka founder hoon.") + _words("FitBox Gym ka founder hoon.", 4)
     assert retake_indices(words) == set(range(7, 12))
+
+
+def test_rule_plan_hook_has_caps_word():
+    from videoagent.planner import rule_plan
+    words = [Word(t, i * 0.4, i * 0.4 + 0.3) for i, t in enumerate("Teen mahine mein sales double ho gayi.".split())]
+    plan = rule_plan(words)
+    assert "SALES" in plan.hook_options[0]
+    assert plan.reel_ranges == [(0, 6)]
+
+
+def test_sdr_filter_only_for_hdr():
+    from videoagent.ffmpeg_tools import sdr_filter
+    assert sdr_filter(False) == ""
+    chain = sdr_filter(True)
+    assert chain.endswith(",") and ("tonemap" in chain or "colorspace" in chain)
+
+
+def test_ffmpeg_listing_parser_handles_old_and_new_formats():
+    from videoagent.ffmpeg_tools import _names
+    old = "Filters:\n  T.. = Timeline support\n  | = Source or sink filter\n TSC overlay   VV->V   Overlay\n ... ass   V->V  ASS\n"
+    new = "Filters:\n  | = Source\n  ------\n TS overlay   VV->V   Overlay\n .. ass   V->V  ASS\n"
+    enc = "Encoders:\n V..... = Video\n ------\n V....D libx264  H.264\n A....D aac   AAC\n"
+    assert _names(old) == {"overlay", "ass"} == _names(new)
+    assert _names(enc) == {"libx264", "aac"}
