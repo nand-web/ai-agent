@@ -143,9 +143,10 @@ def build_command(job: RenderJob) -> list[str]:
 
     # ---- emoji pop-ups
     tall = H > W
-    ew = _even(W * (0.22 if tall else 0.11))
-    ex = "(W-w)/2" if tall else f"W*0.80-w/2"
-    ey = f"H*0.36" if tall else "H*0.14"
+    # upper right, clear of the face, the logo and the captions
+    ew = _even(W * (0.20 if tall else 0.11))
+    ex = "W*0.78-w/2" if tall else "W*0.80-w/2"
+    ey = "H*0.15" if tall else "H*0.16"
     for k, e in enumerate(job.emoji):
         dur = e.end - e.start
         idx = add_input("-loop", "1", "-framerate", str(fps), "-t", f"{e.end + 0.1:.2f}", "-i", str(e.path))
