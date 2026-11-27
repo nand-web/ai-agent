@@ -45,13 +45,15 @@ class EditPlan:
 
 # ---------------------------------------------------------------- helpers
 
-def sentences(words: list[Word]) -> list[tuple[int, int]]:
-    """Split into (first, last) word-index ranges on punctuation or long pauses."""
+def sentences(words: list[Word], breaks: list[float] | None = None) -> list[tuple[int, int]]:
+    """Split into (first, last) word-index ranges on punctuation, long pauses and take boundaries."""
     out, start = [], 0
+    cuts = sorted(breaks or [])
     for i, w in enumerate(words):
         end_punct = w.text.endswith((".", "?", "!", "।"))
         long_gap = i + 1 < len(words) and words[i + 1].start - w.end > 0.9
-        if end_punct or long_gap or i == len(words) - 1:
+        take_break = i + 1 < len(words) and any(w.start < b <= words[i + 1].start for b in cuts)
+        if end_punct or long_gap or take_break or i == len(words) - 1:
             out.append((start, i))
             start = i + 1
     return out
@@ -89,26 +91,34 @@ def _tokens(words: list[Word], a: int, b: int) -> list[str]:
     return [re.sub(r"[^\w]", "", w.text.lower()) for w in words[a : b + 1] if re.sub(r"[^\w]", "", w.text)]
 
 
-def retake_indices(words: list[Word], lookahead: int = 4) -> set[int]:
+def retake_indices(words: list[Word], lookahead: int = 4, take_starts: list[float] | None = None) -> set[int]:
     """Find lines that are said again later (another take, or a false start).
 
     A sentence is dropped when most of its words come back, in order, in one of the
     next few sentences; the later take is kept because it is usually the cleaner one.
     """
-    sents = sentences(words)
+    sents = sentences(words, take_starts)
     removed: set[int] = set()
     for i, (a, b) in enumerate(sents):
+        if a in removed:
+            continue
         mine = _tokens(words, a, b)
         if len(mine) < 2:
             continue
         for c, d in sents[i + 1 : i + 1 + lookahead]:
+            if c in removed:
+                continue
             other = _tokens(words, c, d)
+            if not other:
+                continue
             m = difflib.SequenceMatcher(None, mine, other, autojunk=False)
             matched = sum(bl.size for bl in m.get_matching_blocks())
             starts_same = other[:2] == mine[:2]
-            if matched / len(mine) >= 0.6 and (starts_same or len(mine) >= 4):
-                removed.update(range(a, b + 1))
+            if matched / len(mine) >= 0.75 and (starts_same or len(mine) >= 4):
+                removed.update(range(a, b + 1))   # said again later: keep the later take
                 break
+            if len(other) >= 3 and len(other) < len(mine) and matched / len(other) >= 0.9:
+                removed.update(range(c, d + 1))   # later line is only a piece of this one
     return removed
 
 
@@ -116,8 +126,8 @@ def retake_indices(words: list[Word], lookahead: int = 4) -> set[int]:
 
 def rule_plan(words: list[Word], reel_max: float = 60.0, take_starts: list[float] | None = None) -> EditPlan:
     plan = EditPlan(source="rules")
-    plan.removed = retake_indices(words)
-    sents = sentences(words)
+    plan.removed = retake_indices(words, take_starts=take_starts)
+    sents = sentences(words, take_starts)
     if not sents:
         return plan
 
@@ -237,7 +247,7 @@ def transcript_for_prompt(words: list[Word], take_starts: list[float] | None = N
     take_no = 1
     if take_starts and len(take_starts) > 1:
         lines.append("=== Take 1 ===")
-    for a, b in sentences(words):
+    for a, b in sentences(words, take_starts):
         while takes and words[a].start >= takes[0]:
             takes.pop(0)
             take_no += 1

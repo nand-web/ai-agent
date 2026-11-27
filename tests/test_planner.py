@@ -60,3 +60,20 @@ def test_prompt_marks_takes():
     words = _words("Pehli line.") + _words("Doosri line.", 20)
     text = transcript_for_prompt(words, take_starts=[0.0, 19.0])
     assert text.splitlines()[0] == "=== Take 1 ===" and "=== Take 2 ===" in text
+
+
+def test_take_boundary_splits_sentence_and_keeps_intro():
+    from videoagent.planner import retake_indices
+    take1 = _words("main Rahul FitBox Gym ka founder hoon.") + _words("Humne ek", 2.5)
+    take2 = _words("FitBox Gym ka founder hoon.", 3.3) + _words("Humne ek simple process follow kiya.", 6)
+    words = take1 + take2
+    removed = retake_indices(words, take_starts=[0.0, 3.2])
+    kept = " ".join(w.text for i, w in enumerate(words) if i not in removed)
+    assert "Rahul" in kept               # the longer intro is not lost
+    assert kept.count("Humne ek") == 1   # the false start at the end of take 1 is gone
+
+
+def test_partial_repeat_later_is_removed():
+    from videoagent.planner import retake_indices
+    words = _words("main Rahul FitBox Gym ka founder hoon.") + _words("FitBox Gym ka founder hoon.", 4)
+    assert retake_indices(words) == set(range(7, 12))
