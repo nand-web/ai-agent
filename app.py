@@ -77,12 +77,23 @@ with st.sidebar:
     crf = st.slider("Quality (kam = behtar)", 14, 26, 18)
     whisper = st.selectbox("Transcription model", ["small", "medium", "large-v3", "base"], help="bada model = zyada accurate, zyada time")
 
-video = st.file_uploader("Raw video", type=["mp4", "mov", "m4v", "mkv", "webm"])
+videos = st.file_uploader(
+    "Raw video (ek ya zyada takes)", type=["mp4", "mov", "m4v", "mkv", "webm"], accept_multiple_files=True,
+    help="Alag-alag takes ek saath daal sakte ho. Agent unhe jodega aur repeat lines ka sirf behtar take rakhega.",
+)
+order: list = []
+if videos and len(videos) > 1:
+    names = [v.name for v in videos]
+    picked = st.multiselect("Takes ka order (upar se neeche)", names, default=sorted(names))
+    order = [next(v for v in videos if v.name == n) for n in picked]
+elif videos:
+    order = list(videos)
 if not have_api_key():
     st.info("ANTHROPIC_API_KEY set nahi hai: AI plan ki jagah simple rules use honge (retakes nahi hatenge, B-roll nahi chunega).")
 
-if video and st.button("Edit video", type="primary", disabled=not formats):
-    src = save_upload(video, "in")
+if order and st.button("Edit video", type="primary", disabled=not formats):
+    srcs = [Path(save_upload(v, "in")) for v in order]
+    src = str(srcs[0])
     opts = EditOptions(
         formats=formats, reel_max_seconds=reel_s,
         remove_fillers=fillers, remove_silence=silence, remove_retakes=retakes, jump_zoom=zoom,
@@ -104,7 +115,7 @@ if video and st.button("Edit video", type="primary", disabled=not formats):
 
     with st.spinner("Editing... (lambi video mein kuch minute lagenge)"):
         try:
-            result = edit(Path(src), opts, out_dir, log=log)
+            result = edit(srcs if len(srcs) > 1 else srcs[0], opts, out_dir, log=log)
         except Exception as e:
             st.error(f"Edit fail hua: {e}")
             st.stop()

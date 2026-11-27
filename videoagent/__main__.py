@@ -11,7 +11,7 @@ from .pipeline import edit
 
 def main() -> None:
     p = argparse.ArgumentParser(prog="videoagent", description="AI editor for talking-head testimonials and vlogs")
-    p.add_argument("video", type=Path)
+    p.add_argument("video", type=Path, nargs="+", help="one video, or several takes in order")
     p.add_argument("--out", type=Path, default=Path("output"))
     p.add_argument("--formats", default="youtube,reel", help="youtube,reel")
     p.add_argument("--transcript", type=Path, help="use an existing transcript JSON instead of Whisper")
@@ -61,7 +61,7 @@ def main() -> None:
         crf=a.crf, preset=a.preset,
         use_ai=not a.no_ai, language=a.language, whisper_model=a.whisper_model,
     )
-    result = edit(a.video, opts, a.out, transcript_path=a.transcript)
+    result = edit(a.video if len(a.video) > 1 else a.video[0], opts, a.out, transcript_path=a.transcript)
     print(json.dumps(result["outputs"], indent=2))
 
 

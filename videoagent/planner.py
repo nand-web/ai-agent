@@ -5,6 +5,7 @@ Without one (or if the call fails) a rule-based plan is used, so the tool still 
 """
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -82,14 +83,45 @@ def _score_sentence(text: str) -> int:
     return sum(2 for k in HOOK_WORDS if k in t) + len(re.findall(r"\d", t))
 
 
+# ---------------------------------------------------------------- retakes
+
+def _tokens(words: list[Word], a: int, b: int) -> list[str]:
+    return [re.sub(r"[^\w]", "", w.text.lower()) for w in words[a : b + 1] if re.sub(r"[^\w]", "", w.text)]
+
+
+def retake_indices(words: list[Word], lookahead: int = 4) -> set[int]:
+    """Find lines that are said again later (another take, or a false start).
+
+    A sentence is dropped when most of its words come back, in order, in one of the
+    next few sentences; the later take is kept because it is usually the cleaner one.
+    """
+    sents = sentences(words)
+    removed: set[int] = set()
+    for i, (a, b) in enumerate(sents):
+        mine = _tokens(words, a, b)
+        if len(mine) < 2:
+            continue
+        for c, d in sents[i + 1 : i + 1 + lookahead]:
+            other = _tokens(words, c, d)
+            m = difflib.SequenceMatcher(None, mine, other, autojunk=False)
+            matched = sum(bl.size for bl in m.get_matching_blocks())
+            starts_same = other[:2] == mine[:2]
+            if matched / len(mine) >= 0.6 and (starts_same or len(mine) >= 4):
+                removed.update(range(a, b + 1))
+                break
+    return removed
+
+
 # ---------------------------------------------------------------- rule-based plan
 
-def rule_plan(words: list[Word], reel_max: float = 60.0) -> EditPlan:
+def rule_plan(words: list[Word], reel_max: float = 60.0, take_starts: list[float] | None = None) -> EditPlan:
     plan = EditPlan(source="rules")
+    plan.removed = retake_indices(words)
     sents = sentences(words)
     if not sents:
         return plan
 
+    sents = [s for s in sents if s[0] not in plan.removed] or sents
     best = max(sents, key=lambda s: _score_sentence(_text(words, *s)))
     hook_words = _text(words, *best).split()[:9]
     for k, w in enumerate(hook_words):  # put the key word in CAPS so it gets highlighted
@@ -113,6 +145,8 @@ def rule_plan(words: list[Word], reel_max: float = 60.0) -> EditPlan:
     used: set[str] = set()
     last_t = -10.0
     for i, w in enumerate(words):
+        if i in plan.removed:
+            continue
         low = w.text.lower()
         for emoji, keys in EMOJI_KEYWORDS.items():
             if emoji not in used and any(k in low for k in keys) and w.start - last_t > 4:
@@ -197,9 +231,17 @@ SCHEMA = {
 }
 
 
-def transcript_for_prompt(words: list[Word]) -> str:
+def transcript_for_prompt(words: list[Word], take_starts: list[float] | None = None) -> str:
     lines = []
+    takes = list(take_starts or [])[1:]
+    take_no = 1
+    if take_starts and len(take_starts) > 1:
+        lines.append("=== Take 1 ===")
     for a, b in sentences(words):
+        while takes and words[a].start >= takes[0]:
+            takes.pop(0)
+            take_no += 1
+            lines.append(f"=== Take {take_no} ===")
         body = " ".join(f"{i}:{words[i].text}" for i in range(a, b + 1))
         lines.append(f"[{words[a].start:6.1f}s] {body}")
     return "\n".join(lines)
@@ -223,13 +265,20 @@ def _parse(data: dict, n: int) -> EditPlan:
     return plan
 
 
-def claude_plan(words: list[Word], reel_max: float = 60.0) -> EditPlan:
+def claude_plan(words: list[Word], reel_max: float = 60.0, take_starts: list[float] | None = None) -> EditPlan:
     import anthropic
 
     client = anthropic.Anthropic()
+    takes_note = ""
+    if take_starts and len(take_starts) > 1:
+        takes_note = (
+            f"The recording is {len(take_starts)} separate takes joined in order (marked below). "
+            "Takes often repeat the same lines: keep the best version of each line once, "
+            "and remove the other versions completely.\n"
+        )
     user = (
-        f"Reel should be at most {int(reel_max)} seconds.\n"
-        f"Transcript ({len(words)} words, format index:word):\n\n{transcript_for_prompt(words)}"
+        f"Reel should be at most {int(reel_max)} seconds.\n{takes_note}"
+        f"Transcript ({len(words)} words, format index:word):\n\n{transcript_for_prompt(words, take_starts)}"
     )
     response = client.beta.messages.create(
         model=MODEL,
@@ -252,14 +301,17 @@ def have_api_key() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
-def make_plan(words: list[Word], *, use_ai: bool = True, reel_max: float = 60.0, log=print) -> EditPlan:
+def make_plan(words: list[Word], *, use_ai: bool = True, reel_max: float = 60.0, take_starts: list[float] | None = None, log=print) -> EditPlan:
     if use_ai and have_api_key():
         try:
-            plan = claude_plan(words, reel_max)
+            plan = claude_plan(words, reel_max, take_starts)
             log(f"AI plan ready: {len(plan.removed)} words removed, {len(plan.broll)} B-roll, {len(plan.emphasis)} emoji")
             return plan
         except Exception as e:  # network, auth, refusal: fall back so the edit still happens
             log(f"AI plan failed ({e}); using rule-based plan")
     elif use_ai:
         log("No ANTHROPIC_API_KEY set; using rule-based plan")
-    return rule_plan(words, reel_max)
+    plan = rule_plan(words, reel_max, take_starts)
+    if plan.removed:
+        log(f"Removed {len(plan.removed)} words of repeated takes / false starts")
+    return plan

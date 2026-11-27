@@ -1,6 +1,7 @@
 """Raw video in, finished YouTube and Reel videos out."""
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 from . import assets
 from .config import EditOptions
 from .cuts import Segment, Timeline, filler_indices, keep_segments, restrict
-from .media import face_center, probe
+from .media import face_center, join_takes, probe
 from .overlays import Overlay as AssSize, build_ass
 from .planner import EditPlan, make_plan
 from .render import Overlay, RenderJob, run, snap
@@ -31,20 +32,31 @@ def _plan_to_json(plan: EditPlan) -> dict:
 
 
 def edit(
-    video: Path,
+    video: Path | list[Path],
     opts: EditOptions,
     out_dir: Path,
     *,
     transcript_path: Path | None = None,
     log=print,
 ) -> dict:
-    video, out_dir = Path(video), Path(out_dir)
+    """Edit one video, or several takes of the same recording (joined in the given order)."""
+    out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    takes = [Path(v) for v in video] if isinstance(video, (list, tuple)) else [Path(video)]
+    take_starts: list[float] | None = None
+    if len(takes) > 1:
+        joined = out_dir / f"{takes[0].stem}_takes.mkv"
+        take_starts = join_takes(takes, joined, log=log)
+        video = joined
+        log(f"{len(takes)} takes joined: " + ", ".join(t.name for t in takes))
+    else:
+        video = takes[0]
     info = probe(video)
     log(f"Video: {info.width}x{info.height}, {info.fps:g} fps, {info.duration:.1f}s")
 
     # 1. transcript
-    cached = out_dir / f"{video.stem}.transcript.json"
+    key = hashlib.sha1("|".join(f"{t.name}:{t.stat().st_size}" for t in takes).encode()).hexdigest()[:8]
+    cached = out_dir / f"{video.stem}.{key}.transcript.json"
     if transcript_path:
         words = load_words(transcript_path)
     elif cached.exists():
@@ -57,7 +69,7 @@ def edit(
     log(f"Transcript: {len(words)} words")
 
     # 2. plan
-    plan = make_plan(words, use_ai=opts.use_ai, reel_max=opts.reel_max_seconds, log=log)
+    plan = make_plan(words, use_ai=opts.use_ai, reel_max=opts.reel_max_seconds, take_starts=take_starts, log=log)
     (out_dir / f"{video.stem}.plan.json").write_text(json.dumps(_plan_to_json(plan), ensure_ascii=False, indent=1), encoding="utf-8")
 
     removed: set[int] = set()

@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+import numpy as np
 
 
 @dataclass
@@ -19,6 +22,18 @@ def save_words(words: list[Word], path: Path) -> None:
 
 def load_words(path: Path) -> list[Word]:
     return [Word(**w) for w in json.loads(Path(path).read_text(encoding="utf-8"))]
+
+
+def load_audio(path: Path, sr: int = 16000) -> np.ndarray:
+    """Decode audio with FFmpeg (16 kHz mono float32), the format Whisper expects.
+
+    Done here instead of inside faster-whisper so we do not depend on a PyAV version.
+    """
+    raw = subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    return np.frombuffer(raw, dtype=np.float32).copy()
 
 
 def transcribe(video: Path, model_size: str = "small", language: str = "") -> list[Word]:
@@ -39,7 +54,7 @@ def transcribe(video: Path, model_size: str = "small", language: str = "") -> li
 
     model = WhisperModel(model_size, device=device, compute_type=compute)
     segments, _info = model.transcribe(
-        str(video),
+        load_audio(video),
         language=language or None,
         word_timestamps=True,
         vad_filter=True,

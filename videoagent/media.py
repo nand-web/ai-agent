@@ -79,3 +79,41 @@ def face_center(path: Path, samples: int = 24) -> tuple[float, float]:
         return 0.5, 0.42
     xs.sort(), ys.sort()
     return xs[len(xs) // 2], ys[len(ys) // 2]
+
+
+def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
+    """Join several takes into one high-quality working file.
+
+    Every take is fitted (no cropping) into the first take's frame size and fps, with
+    48 kHz stereo audio, so the rest of the pipeline sees one continuous recording.
+    Returns the start time of each take in the joined file.
+    """
+    infos = [probe(p) for p in paths]
+    first = infos[0]
+    W, H = first.width - first.width % 2, first.height - first.height % 2
+    fps = first.fps
+    args: list[str] = []
+    parts: list[str] = []
+    for i, (p, info) in enumerate(zip(paths, infos)):
+        args += ["-i", str(p)]
+        parts.append(
+            f"[{i}:v]scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}]"
+        )
+        if info.has_audio:
+            parts.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{info.duration:.3f}[a{i}]")
+        else:
+            parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{info.duration:.3f}[a{i}]")
+    parts.append("".join(f"[v{i}][a{i}]" for i in range(len(paths))) + f"concat=n={len(paths)}:v=1:a=1[v][a]")
+    log(f"Joining {len(paths)} takes...")
+    subprocess.run(
+        ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", *args, "-filter_complex", ";".join(parts),
+         "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-crf", "12", "-preset", "veryfast",
+         "-c:a", "pcm_s16le", str(out)],
+        check=True,
+    )
+    starts, acc = [], 0.0
+    for info in infos:
+        starts.append(acc)
+        acc += info.duration
+    return starts
