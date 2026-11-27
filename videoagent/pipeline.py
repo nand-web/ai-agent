@@ -10,7 +10,7 @@ from pathlib import Path
 from . import assets
 from .config import EditOptions
 from .cuts import Segment, Timeline, filler_indices, keep_segments, restrict
-from .media import face_center, join_takes, probe
+from .media import face_center, joined_audio, open_sources
 from .ffmpeg_tools import preflight
 from .overlays import build_events, render_text_track
 from .planner import EditPlan, make_plan
@@ -20,8 +20,8 @@ from .transcript import Word, load_words, save_words, transcribe
 HOOK_END = 3.2
 
 
-def _size(fmt: str, src_w: int, src_h: int) -> tuple[int, int]:
-    big = max(src_w, src_h) >= 3200
+def _size(fmt: str, src_w: int, src_h: int, resolution: str = "1080p") -> tuple[int, int]:
+    big = resolution == "4k" and max(src_w, src_h) >= 3200
     if fmt == "reel":
         return (2160, 3840) if big else (1080, 1920)
     return (3840, 2160) if big else (1920, 1080)
@@ -46,20 +46,16 @@ def edit(
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     takes = [Path(v) for v in video] if isinstance(video, (list, tuple)) else [Path(video)]
-    take_starts: list[float] | None = None
+    sources, info = open_sources(takes)
+    take_starts = [s.offset for s in sources] if len(sources) > 1 else None
+    stem = takes[0].stem + ("_takes" if len(takes) > 1 else "")
     if len(takes) > 1:
-        joined = out_dir / f"{takes[0].stem}_takes.mkv"
-        take_starts = join_takes(takes, joined, log=log)
-        video = joined
-        log(f"{len(takes)} takes joined: " + ", ".join(t.name for t in takes))
-    else:
-        video = takes[0]
-    info = probe(video)
-    log(f"Video: {info.width}x{info.height}, {info.fps:g} fps, {info.duration:.1f}s")
+        log(f"{len(takes)} takes: " + ", ".join(t.name for t in takes))
+    log(f"Video: {info.width}x{info.height}, {info.fps:g} fps, {info.duration:.1f}s" + (" (HDR)" if any(s.info.hdr for s in sources) else ""))
 
     # 1. transcript
     key = hashlib.sha1("|".join(f"{t.name}:{t.stat().st_size}" for t in takes).encode()).hexdigest()[:8]
-    cached = out_dir / f"{video.stem}.{key}.transcript.json"
+    cached = out_dir / f"{stem}.{key}.transcript.json"
     if transcript_path:
         words = load_words(transcript_path)
     elif cached.exists():
@@ -67,13 +63,13 @@ def edit(
         log("Using saved transcript")
     else:
         log(f"Transcribing with Whisper ({opts.whisper_model})... this can take a few minutes")
-        words = transcribe(video, opts.whisper_model, opts.language)
+        words = transcribe(joined_audio(sources), opts.whisper_model, opts.language, log=log)
     save_words(words, cached)
     log(f"Transcript: {len(words)} words")
 
     # 2. plan
     plan = make_plan(words, use_ai=opts.use_ai, reel_max=opts.reel_max_seconds, take_starts=take_starts, log=log)
-    (out_dir / f"{video.stem}.plan.json").write_text(json.dumps(_plan_to_json(plan), ensure_ascii=False, indent=1), encoding="utf-8")
+    (out_dir / f"{stem}.plan.json").write_text(json.dumps(_plan_to_json(plan), ensure_ascii=False, indent=1), encoding="utf-8")
 
     removed: set[int] = set()
     if opts.remove_fillers:
@@ -88,18 +84,18 @@ def edit(
         )
     else:
         base = [Segment(0, info.duration)]
-    face = face_center(video)
+    face = face_center(takes[0])
     log(f"Kept {sum(s.dur for s in base):.1f}s of {info.duration:.1f}s; face at x={face[0]:.2f}")
 
     results = {"plan": _plan_to_json(plan), "outputs": {}}
     for fmt in opts.formats:
-        out = _render_format(fmt, video, info, words, removed, base, plan, face, opts, out_dir, log)
+        out = _render_format(fmt, stem, sources, info, words, removed, base, plan, face, opts, out_dir, log)
         results["outputs"][fmt] = str(out)
     return results
 
 
-def _render_format(fmt, video, info, words: list[Word], removed, base, plan: EditPlan, face, opts: EditOptions, out_dir: Path, log):
-    W, H = _size(fmt, info.width, info.height)
+def _render_format(fmt, stem: str, sources, info, words: list[Word], removed, base, plan: EditPlan, face, opts: EditOptions, out_dir: Path, log):
+    W, H = _size(fmt, info.width, info.height, opts.resolution)
     tall = H > W
     segs = base
     if fmt == "reel" and plan.reel_ranges and words:
@@ -185,7 +181,7 @@ def _render_format(fmt, video, info, words: list[Word], removed, base, plan: Edi
 
     logo = Path(opts.logo_path) if opts.logo_path and Path(opts.logo_path).exists() else None
     job = RenderJob(
-        src=video, info=info, segs=segs, out=out_dir / f"{video.stem}_{fmt}.mp4",
+        sources=sources, info=info, segs=segs, out=out_dir / f"{stem}_{fmt}.mp4",
         width=W, height=H, face=face, text_track=text_track,
         zoom_segments=list(range(1, len(segs), 2)) if opts.jump_zoom else [],
         broll=broll, emoji=emoji, logo=logo, logo_opacity=opts.logo_opacity,

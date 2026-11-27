@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 
-from .ffmpeg_tools import sdr_filter, video_args
 
 
 @dataclass
@@ -54,70 +53,78 @@ def probe(path: Path) -> VideoInfo:
 
 
 def face_center(path: Path, samples: int = 24) -> tuple[float, float]:
-    """Median face centre as fractions of width/height; (0.5, 0.42) when no face is found."""
+    """Median face centre as fractions of width/height; (0.5, 0.42) when no face is found.
+
+    FFmpeg decodes only keyframes at small size, which is fast even for 4K HEVC.
+    """
     try:
         import cv2
+        import numpy as np
     except ImportError:
         return 0.5, 0.42
-    cap = cv2.VideoCapture(str(path))
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    info = probe(path)
+    sw = 480
+    sh = max(2, round(sw * info.height / info.width / 2) * 2)
+    raw = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-skip_frame", "nokey", "-i", str(Path(path).resolve()),
+         "-vf", f"scale={sw}:{sh}", "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True,
+    ).stdout
+    n = len(raw) // (sw * sh)
+    if n == 0:
+        return 0.5, 0.42
+    frames = np.frombuffer(raw[: n * sw * sh], dtype=np.uint8).reshape(n, sh, sw)
+    picks = sorted({int(i) for i in np.linspace(0, n - 1, min(samples, n))})
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     xs, ys = [], []
-    for k in range(samples):
-        if total:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * (k + 0.5) / samples))
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        h, w = frame.shape[:2]
-        scale = 640 / max(w, h)
-        small = cv2.resize(frame, (int(w * scale), int(h * scale)))
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        faces = cascade.detectMultiScale(gray, 1.1, 5, minSize=(40, 40))
+    for i in picks:
+        faces = cascade.detectMultiScale(frames[i], 1.1, 5, minSize=(30, 30))
         if len(faces):
             x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-            xs.append((x + fw / 2) / small.shape[1])
-            ys.append((y + fh / 2) / small.shape[0])
-    cap.release()
+            xs.append((x + fw / 2) / sw)
+            ys.append((y + fh / 2) / sh)
     if not xs:
         return 0.5, 0.42
     xs.sort(), ys.sort()
     return xs[len(xs) // 2], ys[len(ys) // 2]
 
 
-def join_takes(paths: list[Path], out: Path, log=print) -> list[float]:
-    """Join several takes into one high-quality working file.
+@dataclass
+class Source:
+    """One take, placed on the joined timeline at `offset` seconds."""
+    path: Path
+    info: VideoInfo
+    offset: float
+    duration: float          # length used on the timeline (whole frames)
 
-    Every take is fitted (no cropping) into the first take's frame size and fps, with
-    48 kHz stereo audio, so the rest of the pipeline sees one continuous recording.
-    Returns the start time of each take in the joined file.
+
+def open_sources(paths: list[Path]) -> tuple[list[Source], VideoInfo]:
+    """Probe the takes and lay them end to end on one timeline.
+
+    No joined file is written: the renderer cuts every take directly, so nothing is
+    re-encoded twice and 4K takes keep full resolution for the reel crop.
     """
     infos = [probe(p) for p in paths]
     first = infos[0]
-    W, H = first.width - first.width % 2, first.height - first.height % 2
     fps = first.fps
-    args: list[str] = []
-    parts: list[str] = []
-    for i, (p, info) in enumerate(zip(paths, infos)):
-        args += ["-i", str(Path(p).resolve())]
-        parts.append(
-            f"[{i}:v]{sdr_filter(info.hdr)}scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,"
-            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps},format=yuv420p[v{i}]"
-        )
-        if info.has_audio:
-            parts.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo,apad,atrim=0:{info.duration:.3f}[a{i}]")
-        else:
-            parts.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{info.duration:.3f}[a{i}]")
-    parts.append("".join(f"[v{i}][a{i}]" for i in range(len(paths))) + f"concat=n={len(paths)}:v=1:a=1[v][a]")
-    log(f"Joining {len(paths)} takes...")
-    subprocess.run(
-        ["ffmpeg", "-y", "-nostdin", "-loglevel", "error", *args, "-filter_complex", ";".join(parts),
-         "-map", "[v]", "-map", "[a]", *video_args(W, H, intermediate=True),
-         "-c:a", "pcm_s16le", str(Path(out).resolve())],
-        check=True,
-    )
-    starts, acc = [], 0.0
-    for info in infos:
-        starts.append(acc)
-        acc += info.duration
-    return starts
+    sources, acc = [], 0.0
+    for p, info in zip(paths, infos):
+        dur = int(info.duration * fps) / fps
+        sources.append(Source(Path(p).resolve(), info, acc, dur))
+        acc += dur
+    combined = VideoInfo(first.width, first.height, fps, acc, any(i.has_audio for i in infos), first.hdr)
+    return sources, combined
+
+
+def joined_audio(sources: list[Source], sr: int = 16000):
+    """16 kHz mono audio of all takes back to back, aligned with the timeline."""
+    import numpy as np
+
+    from .transcript import load_audio
+
+    parts = []
+    for src in sources:
+        n = int(round(src.duration * sr))
+        a = load_audio(src.path, sr) if src.info.has_audio else np.zeros(0, dtype=np.float32)
+        parts.append(a[:n] if len(a) >= n else np.pad(a, (0, n - len(a))))
+    return np.concatenate(parts)

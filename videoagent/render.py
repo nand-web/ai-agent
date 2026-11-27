@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .cuts import Segment
-from .ffmpeg_tools import sdr_filter, video_args
-from .media import VideoInfo
+from .ffmpeg_tools import decode_args, run_ffmpeg, sdr_filter, video_args
+from .media import Source, VideoInfo
 
 
 @dataclass
@@ -19,8 +19,8 @@ class Overlay:
 
 @dataclass
 class RenderJob:
-    src: Path
-    info: VideoInfo
+    sources: list[Source]      # takes on one timeline (a single video is one source)
+    info: VideoInfo            # the joined timeline: first take's size/fps, total duration
     segs: list[Segment]
     out: Path
     width: int
@@ -70,7 +70,7 @@ def _cover(src_w: int, src_h: int, W: int, H: int, fx: float, fy: float) -> str:
     return f"crop={cw}:{ch}:{int(x)}:{int(y)},scale={W}:{H}:flags=lanczos,setsar=1"
 
 
-def build_command(job: RenderJob) -> list[str]:
+def build_command(job: RenderJob, hwaccel: bool = True) -> list[str]:
     info, W, H = job.info, job.width, job.height
     fps = info.fps
     segs = snap(job.segs, fps, info.duration)
@@ -79,8 +79,10 @@ def build_command(job: RenderJob) -> list[str]:
     total = sum(s.dur for s in segs)
     eps = 0.5 / fps
 
-    inputs: list[str] = ["-i", str(Path(job.src).resolve())]
-    n_in = 1
+    inputs: list[str] = []
+    for src in job.sources:
+        inputs += [*(decode_args() if hwaccel else []), "-i", str(Path(src.path).resolve())]
+    n_in = len(job.sources)
 
     def add_input(*args: str) -> int:
         nonlocal n_in
@@ -89,21 +91,45 @@ def build_command(job: RenderJob) -> list[str]:
         return n_in - 1
 
     g: list[str] = []
-    keep_v = "+".join(f"gte(t,{s.start - eps:.4f})*lt(t,{s.end - eps:.4f})" for s in segs)
-    keep_a = "+".join(f"gte(t,{s.start:.4f})*lt(t,{s.end:.4f})" for s in segs)
-
-    # ---- video: CFR, cut, frame for the target shape
-    g.append(f"[0:v]fps={fps},select='{keep_v}',setpts=N/({fps})/TB,{sdr_filter(info.hdr)}setsar=1[cut]")
-    tall_src_to_wide = info.aspect < (W / H) * 0.8
-    if tall_src_to_wide:
-        # vertical source into 16:9: blurred fill behind the sharp video
-        g.append(
-            f"[cut]split[bgi][fgi];"
-            f"[bgi]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=40,colorchannelmixer=rr=0.85:gg=0.85:bb=0.85[bg];"
-            f"[fgi]scale=-2:{H}:flags=lanczos[fg];[bg][fg]overlay=(W-w)/2:0,setsar=1[framed]"
-        )
+    # ---- every take: CFR, cut its own pieces, frame for the target shape; then join
+    parts: list[str] = []
+    for si, src in enumerate(job.sources):
+        lo, hi = src.offset, src.offset + src.duration
+        local = [Segment(max(s.start, lo) - lo, min(s.end, hi) - lo) for s in segs if min(s.end, hi) - max(s.start, lo) > 0.5 / fps]
+        if not local:
+            continue
+        keep_v = "+".join(f"gte(t,{s.start - eps:.4f})*lt(t,{s.end - eps:.4f})" for s in local)
+        keep_a = "+".join(f"gte(t,{s.start:.4f})*lt(t,{s.end:.4f})" for s in local)
+        local_total = sum(s.dur for s in local)
+        sinfo = src.info
+        tall_src_to_wide = sinfo.aspect < (W / H) * 0.8
+        sdr = sdr_filter(sinfo.hdr)
+        # HDR->SDR is costly: do it after downscaling, except for the blurred-fill layout
+        early_sdr = sdr if tall_src_to_wide else ""
+        g.append(f"[{si}:v]fps={fps},select='{keep_v}',setpts=N/({fps})/TB,{early_sdr}setsar=1[cut{si}]")
+        if tall_src_to_wide:
+            # vertical source into 16:9: blurred fill behind the sharp video
+            g.append(
+                f"[cut{si}]split[bgi{si}][fgi{si}];"
+                f"[bgi{si}]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},gblur=sigma=40,"
+                f"colorchannelmixer=rr=0.85:gg=0.85:bb=0.85[bg{si}];"
+                f"[fgi{si}]scale=-2:{H}:flags=lanczos[fg{si}];[bg{si}][fg{si}]overlay=(W-w)/2:0,setsar=1,format=yuv420p[v{si}]"
+            )
+        else:
+            late_sdr = ("," + sdr.rstrip(",")) if sdr else ""
+            g.append(f"[cut{si}]{_cover(sinfo.width, sinfo.height, W, H, *job.face)}{late_sdr},setsar=1,format=yuv420p[v{si}]")
+        if sinfo.has_audio:
+            g.append(f"[{si}:a]aselect='{keep_a}',asetpts=N/SR/TB,aresample=48000,aformat=channel_layouts=stereo[a{si}]")
+        else:
+            g.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{local_total:.4f}[a{si}]")
+        parts.append(str(si))
+    if not parts:
+        raise ValueError("Nothing left to keep after cutting")
+    if len(parts) == 1:
+        g.append(f"[v{parts[0]}]null[framed];[a{parts[0]}]anull[araw]")
     else:
-        g.append(f"[cut]{_cover(info.width, info.height, W, H, *job.face)}[framed]")
+        pads = "".join(f"[v{i}][a{i}]" for i in parts)
+        g.append(f"{pads}concat=n={len(parts)}:v=1:a=1[framed][araw]")
     cur = "framed"
 
     # ---- jump-cut punch-in: a zoomed copy shown on alternating segments
@@ -169,10 +195,6 @@ def build_command(job: RenderJob) -> list[str]:
     g.append(f"[{cur}]format=yuv420p[vout]")
 
     # ---- audio
-    if info.has_audio:
-        g.append(f"[0:a]aselect='{keep_a}',asetpts=N/SR/TB,aresample=48000,aformat=channel_layouts=stereo[araw]")
-    else:
-        g.append(f"anullsrc=r=48000:cl=stereo,atrim=0:{total:.3f}[araw]")
     if job.clean_audio and info.has_audio:
         g.append("[araw]highpass=f=80,afftdn=nf=-25,loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000[voice]")
     else:
@@ -213,7 +235,7 @@ def build_command(job: RenderJob) -> list[str]:
     graph = _split_reused(";".join(g), sfx_inputs)
 
     return [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         *inputs,
         "-filter_complex", graph,
         "-map", "[vout]", "-map", "[aout]",
@@ -241,11 +263,14 @@ def _split_reused(graph: str, sfx_inputs: dict[Path, int]) -> str:
 
 
 def run(job: RenderJob, log=print) -> Path:
-    cmd = build_command(job)
     job.out.parent.mkdir(parents=True, exist_ok=True)
     log(f"Rendering {job.out.name} ({job.width}x{job.height})")
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        tail = "\n".join((proc.stderr or "").strip().splitlines()[-15:])
-        raise RuntimeError(f"FFmpeg failed for {job.out.name}:\n{tail}")
+    total = sum(s.dur for s in snap(job.segs, job.info.fps, job.info.duration))
+    try:
+        run_ffmpeg(build_command(job), total, job.out.name, log)
+    except RuntimeError:
+        if not decode_args():
+            raise
+        log("  hardware decoding failed, retrying with software decoding")
+        run_ffmpeg(build_command(job, hwaccel=False), total, job.out.name, log)
     return job.out

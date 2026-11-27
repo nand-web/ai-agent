@@ -6,12 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
 # Every filter the pipeline uses. All are built into FFmpeg itself (no external
 # library, no GPL-only filter), so any normal FFmpeg build has them.
 REQUIRED_FILTERS = [
     "fps", "select", "setpts", "split", "crop", "scale", "pad", "setsar", "overlay", "format",
-    "colorchannelmixer", "gblur", "fade", "trim", "concat",
+    "colorchannelmixer", "gblur", "fade", "trim", "concat", "null",
     "aselect", "asetpts", "aresample", "aformat", "atrim", "apad", "anull", "anullsrc", "asplit",
     "highpass", "afftdn", "loudnorm", "volume", "afade", "adelay", "amix", "alimiter", "sidechaincompress",
 ]
@@ -102,3 +103,47 @@ def sdr_filter(hdr: bool) -> str:
                 "tonemap=tonemap=mobius:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p,")
     # no zimg in this FFmpeg: convert the colour space only (HLG still looks close on SDR)
     return "format=yuv420p10le,colorspace=all=bt709:iall=bt2020:itrc=bt2020-10:format=yuv420p,"
+
+
+def run_ffmpeg(cmd: list[str], duration: float, label: str, log=print) -> None:
+    """Run FFmpeg and log progress every 10%, so long renders do not look stuck."""
+    import tempfile
+
+    cmd = [cmd[0], "-progress", "pipe:1", "-nostats", *cmd[1:]]
+    with tempfile.TemporaryFile(mode="w+") as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err, text=True)
+        shown = 0
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if not line.startswith(("out_time_us=", "out_time_ms=")):
+                continue
+            try:
+                t = int(line.split("=", 1)[1]) / 1e6
+            except ValueError:
+                continue
+            pct = int(min(99, t / duration * 100)) if duration > 0 else 0
+            if pct >= shown + 10:
+                shown = pct - pct % 10
+                log(f"  {label}: {shown}%")
+        proc.wait()
+        err.seek(0)
+        stderr = err.read()
+    if proc.returncode != 0:
+        tail = "\n".join(stderr.strip().splitlines()[-15:])
+        raise RuntimeError(f"FFmpeg failed for {label}:\n{tail}")
+    log(f"  {label}: 100%")
+
+
+@functools.lru_cache(maxsize=None)
+def hwaccels() -> frozenset[str]:
+    out = _run(["ffmpeg", "-hide_banner", "-hwaccels"])
+    return frozenset(line.strip() for line in out.splitlines()[1:] if line.strip())
+
+
+def decode_args() -> list[str]:
+    """Hardware video decoding on Macs (much faster for iPhone 4K HEVC); [] elsewhere."""
+    if os.environ.get("VIDEOAGENT_HWACCEL", "1") == "0":
+        return []
+    if sys.platform == "darwin" and "videotoolbox" in hwaccels():
+        return ["-hwaccel", "videotoolbox"]
+    return []

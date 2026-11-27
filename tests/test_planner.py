@@ -101,3 +101,23 @@ def test_ffmpeg_listing_parser_handles_old_and_new_formats():
     enc = "Encoders:\n V..... = Video\n ------\n V....D libx264  H.264\n A....D aac   AAC\n"
     assert _names(old) == {"overlay", "ass"} == _names(new)
     assert _names(enc) == {"libx264", "aac"}
+
+
+def test_render_retries_without_hwaccel(monkeypatch, tmp_path):
+    """If hardware decoding breaks the render, it is retried in software."""
+    from videoagent import render
+    calls = []
+    monkeypatch.setattr(render, "decode_args", lambda: ["-hwaccel", "videotoolbox"])
+
+    def fake_run(cmd, total, label, log):
+        calls.append("-hwaccel" in cmd)
+        if "-hwaccel" in cmd:
+            raise RuntimeError("boom")
+    monkeypatch.setattr(render, "run_ffmpeg", fake_run)
+    from videoagent.cuts import Segment
+    from videoagent.media import Source, VideoInfo
+    info = VideoInfo(1920, 1080, 30.0, 10.0, True)
+    job = render.RenderJob(sources=[Source(tmp_path / "a.mp4", info, 0.0, 10.0)], info=info,
+                           segs=[Segment(0, 5)], out=tmp_path / "o.mp4", width=1920, height=1080)
+    render.run(job, log=lambda m: None)
+    assert calls == [True, False]

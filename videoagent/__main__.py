@@ -43,6 +43,7 @@ def main() -> None:
     p.add_argument("--keep-fillers", action="store_true")
     p.add_argument("--no-zoom", action="store_true")
     p.add_argument("--reel-seconds", type=float, default=60)
+    p.add_argument("--resolution", choices=["1080p", "4k"], default="1080p", help="4k only for 4K sources; much slower")
     p.add_argument("--crf", type=int, default=18, help="lower = better quality, bigger file")
     p.add_argument("--preset", default="medium")
     a = p.parse_args()
@@ -58,7 +59,7 @@ def main() -> None:
         logo_path=a.logo,
         music=not a.no_music, music_path=a.music, music_mood=a.mood, music_volume=a.music_volume, ducking=not a.no_ducking,
         sound_effects=not a.no_sfx, emoji=not a.no_emoji, broll=not a.no_broll, broll_dir=a.broll_dir,
-        crf=a.crf, preset=a.preset,
+        resolution=a.resolution, crf=a.crf, preset=a.preset,
         use_ai=not a.no_ai, language=a.language, whisper_model=a.whisper_model,
     )
     result = edit(a.video if len(a.video) > 1 else a.video[0], opts, a.out, transcript_path=a.transcript)

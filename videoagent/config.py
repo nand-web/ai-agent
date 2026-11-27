@@ -53,6 +53,7 @@ class EditOptions:
     broll_dir: str = ""              # local clips; filename words are used as keywords
 
     # quality
+    resolution: str = "1080p"        # "1080p" | "4k" (4K only when the source is 4K; much slower)
     crf: int = 18
     preset: str = "medium"
 

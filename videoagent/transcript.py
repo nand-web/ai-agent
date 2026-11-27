@@ -36,7 +36,7 @@ def load_audio(path: Path, sr: int = 16000) -> np.ndarray:
     return np.frombuffer(raw, dtype=np.float32).copy()
 
 
-def transcribe(video: Path, model_size: str = "small", language: str = "") -> list[Word]:
+def transcribe(video, model_size: str = "small", language: str = "", log=None) -> list[Word]:
     """Transcribe with faster-whisper and return words with timings.
 
     Runs on CPU by default (int8); uses CUDA automatically when available.
@@ -53,8 +53,10 @@ def transcribe(video: Path, model_size: str = "small", language: str = "") -> li
         pass
 
     model = WhisperModel(model_size, device=device, compute_type=compute)
+    audio = video if isinstance(video, np.ndarray) else load_audio(video)
+    total = len(audio) / 16000
     segments, _info = model.transcribe(
-        load_audio(video),
+        audio,
         language=language or None,
         word_timestamps=True,
         vad_filter=True,
@@ -62,7 +64,12 @@ def transcribe(video: Path, model_size: str = "small", language: str = "") -> li
         initial_prompt="Umm, aaa, toh basically, haan. Hinglish testimonial.",
     )
     words: list[Word] = []
+    shown = 0
     for seg in segments:
+        pct = int(min(99, seg.end / total * 100)) if total else 0
+        if log and pct >= shown + 10:
+            shown = pct - pct % 10
+            log(f"  transcribing: {shown}%")
         for w in seg.words or []:
             text = w.word.strip()
             if text:

@@ -74,6 +74,8 @@ with st.sidebar:
     broll = st.toggle("B-roll stock clips", True, help="assets/broll/ ke clips, ya PEXELS_API_KEY set ho to Pexels se")
 
     st.subheader("Quality")
+    resolution = st.radio("Resolution", ["1080p", "4k"], horizontal=True,
+                          help="4K sirf 4K video par, aur 4-5 guna zyada time leta hai")
     crf = st.slider("Quality (kam = behtar)", 14, 26, 18)
     whisper = st.selectbox("Transcription model", ["small", "medium", "large-v3", "base"], help="bada model = zyada accurate, zyada time")
 
@@ -104,7 +106,7 @@ if order and st.button("Edit video", type="primary", disabled=not formats):
         logo_path=save_upload(logo, "logo"),
         clean_audio=clean, music=music, music_path=save_upload(music_file, "music"), music_mood=mood,
         music_volume=vol, ducking=duck, sound_effects=sfx,
-        emoji=emoji, broll=broll, crf=crf, whisper_model=whisper,
+        emoji=emoji, broll=broll, resolution=resolution, crf=crf, whisper_model=whisper,
     )
     out_dir = WORK / "out" / Path(src).stem
     lines: list[str] = []
