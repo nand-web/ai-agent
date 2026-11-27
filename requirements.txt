@@ -1,0 +1,7 @@
+anthropic>=2.14
+faster-whisper>=1.2
+opencv-python-headless>=4.10,<5
+numpy
+pillow
+streamlit>=1.40
+pytest

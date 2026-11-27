@@ -1,0 +1,182 @@
+"""Raw video in, finished YouTube and Reel videos out."""
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from pathlib import Path
+
+from . import assets
+from .config import EditOptions
+from .cuts import Segment, Timeline, filler_indices, keep_segments, restrict
+from .media import face_center, probe
+from .overlays import Overlay as AssSize, build_ass
+from .planner import EditPlan, make_plan
+from .render import Overlay, RenderJob, run, snap
+from .transcript import Word, load_words, save_words, transcribe
+
+HOOK_END = 3.2
+
+
+def _size(fmt: str, src_w: int, src_h: int) -> tuple[int, int]:
+    big = max(src_w, src_h) >= 3200
+    if fmt == "reel":
+        return (2160, 3840) if big else (1080, 1920)
+    return (3840, 2160) if big else (1920, 1080)
+
+
+def _plan_to_json(plan: EditPlan) -> dict:
+    d = asdict(plan)
+    d["removed"] = sorted(plan.removed)
+    return d
+
+
+def edit(
+    video: Path,
+    opts: EditOptions,
+    out_dir: Path,
+    *,
+    transcript_path: Path | None = None,
+    log=print,
+) -> dict:
+    video, out_dir = Path(video), Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    info = probe(video)
+    log(f"Video: {info.width}x{info.height}, {info.fps:g} fps, {info.duration:.1f}s")
+
+    # 1. transcript
+    cached = out_dir / f"{video.stem}.transcript.json"
+    if transcript_path:
+        words = load_words(transcript_path)
+    elif cached.exists():
+        words = load_words(cached)
+        log("Using saved transcript")
+    else:
+        log(f"Transcribing with Whisper ({opts.whisper_model})... this can take a few minutes")
+        words = transcribe(video, opts.whisper_model, opts.language)
+    save_words(words, cached)
+    log(f"Transcript: {len(words)} words")
+
+    # 2. plan
+    plan = make_plan(words, use_ai=opts.use_ai, reel_max=opts.reel_max_seconds, log=log)
+    (out_dir / f"{video.stem}.plan.json").write_text(json.dumps(_plan_to_json(plan), ensure_ascii=False, indent=1), encoding="utf-8")
+
+    removed: set[int] = set()
+    if opts.remove_fillers:
+        removed |= filler_indices(words)
+    if opts.remove_retakes:
+        removed |= plan.removed
+
+    if words:
+        base = keep_segments(
+            words, removed, info.duration,
+            cut_pauses=opts.remove_silence, max_pause=opts.max_pause, pad=opts.keep_pause,
+        )
+    else:
+        base = [Segment(0, info.duration)]
+    face = face_center(video)
+    log(f"Kept {sum(s.dur for s in base):.1f}s of {info.duration:.1f}s; face at x={face[0]:.2f}")
+
+    results = {"plan": _plan_to_json(plan), "outputs": {}}
+    for fmt in opts.formats:
+        out = _render_format(fmt, video, info, words, removed, base, plan, face, opts, out_dir, log)
+        results["outputs"][fmt] = str(out)
+    return results
+
+
+def _render_format(fmt, video, info, words: list[Word], removed, base, plan: EditPlan, face, opts: EditOptions, out_dir: Path, log):
+    W, H = _size(fmt, info.width, info.height)
+    tall = H > W
+    segs = base
+    if fmt == "reel" and plan.reel_ranges and words:
+        ranges = [(words[a].start - 0.25, words[b].end + 0.35) for a, b in plan.reel_ranges]
+        segs = restrict(base, ranges) or base
+    segs = snap(segs, info.fps, info.duration)
+    if fmt == "reel":
+        # hard cap for platforms
+        capped, acc = [], 0.0
+        for s in segs:
+            if acc >= opts.reel_max_seconds:
+                break
+            take = min(s.dur, opts.reel_max_seconds - acc)
+            capped.append(Segment(s.start, s.start + take))
+            acc += take
+        segs = snap(capped, info.fps, info.duration)
+    tl = Timeline(segs)
+    total = tl.duration
+
+    def at(i: int, end: bool = False) -> float | None:
+        w = words[i]
+        return tl.to_edited(w.end if end else w.start)
+
+    edited_words = [w for i, w in tl.words(words) if i not in removed]
+
+    hook = (opts.hook_text or (plan.hook_options[0] if plan.hook_options else "")) if opts.hook else ""
+    cta = (opts.cta_text or plan.cta) if opts.cta else ""
+    name = opts.person_name if opts.lower_third else ""
+    title = opts.person_title if opts.lower_third else ""
+
+    ass_path = out_dir / f"{video.stem}_{fmt}.ass"
+    ass_path.write_text(
+        build_ass(
+            AssSize(W, H, tall), total,
+            words=edited_words if opts.captions else None,
+            caption_style=opts.caption_style, hook=hook, name=name, title=title, cta=cta,
+        ),
+        encoding="utf-8",
+    )
+
+    busy_start = HOOK_END if hook else 0.3
+    busy_end = total - (4.0 if cta else 0.5)
+    sfx: list[tuple[float, Path]] = []
+    whoosh, pop = (assets.sfx_file("whoosh"), assets.sfx_file("pop")) if opts.sound_effects else (None, None)
+    if hook and whoosh:
+        sfx.append((0.0, whoosh))
+
+    broll: list[Overlay] = []
+    if opts.broll:
+        for b in plan.broll:
+            s, e = at(b.start), at(b.end, end=True)
+            if s is None or e is None:
+                continue
+            e = min(max(e, s + 2.0), s + 5.0, busy_end)
+            if s < busy_start or e - s < 1.5 or any(not (e <= o.start or s >= o.end) for o in broll):
+                continue
+            clip = assets.find_broll(b.query, portrait=tall, folder=opts.broll_dir)
+            if not clip:
+                log(f"  no B-roll found for '{b.query}' (add clips to assets/broll or set PEXELS_API_KEY)")
+                continue
+            broll.append(Overlay(s, e, clip))
+            if whoosh:
+                sfx.append((max(0.0, s - 0.15), whoosh))
+
+    emoji: list[Overlay] = []
+    if opts.emoji or opts.sound_effects:
+        for em in plan.emphasis:
+            t = at(em.word)
+            if t is None or t < busy_start or t > busy_end:
+                continue
+            if opts.emoji and em.emoji:
+                png = assets.emoji_png(em.emoji)
+                if png:
+                    emoji.append(Overlay(t, min(t + 1.6, total), png))
+                    if pop:
+                        sfx.append((t, pop))
+                    continue
+            if em.sfx == "whoosh" and whoosh:
+                sfx.append((t, whoosh))
+
+    music = assets.pick_music(opts.music_path, opts.music_mood) if opts.music else None
+    if opts.music and not music:
+        log("  no music file found (add tracks to assets/music/<mood>/ or pick a file)")
+
+    logo = Path(opts.logo_path) if opts.logo_path and Path(opts.logo_path).exists() else None
+    job = RenderJob(
+        src=video, info=info, segs=segs, out=out_dir / f"{video.stem}_{fmt}.mp4",
+        width=W, height=H, face=face, ass=ass_path,
+        zoom_segments=list(range(1, len(segs), 2)) if opts.jump_zoom else [],
+        broll=broll, emoji=emoji, logo=logo, logo_opacity=opts.logo_opacity,
+        music=music, music_volume=opts.music_volume, ducking=opts.ducking,
+        sfx=sfx, clean_audio=opts.clean_audio, crf=opts.crf, preset=opts.preset,
+    )
+    log(f"[{fmt}] {total:.1f}s, {len(segs)} cuts, {len(broll)} B-roll, {len(emoji)} emoji, music: {music.name if music else 'off'}")
+    return run(job, log=log)
